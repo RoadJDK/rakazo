@@ -1,5 +1,4 @@
 import { createHmac } from "node:crypto";
-import { getLogger } from "@rakazo/logging";
 import type {
   AdapterContext,
   ConnectorCall,
@@ -8,6 +7,7 @@ import type {
   ConnectorTool,
   ManagedConnectorProvider,
 } from "@rakazo/adapter-kit";
+import { getLogger } from "@rakazo/logging";
 import { catalogToolPrefix } from "./approval-effect.js";
 import { collectPages, filterCatalog } from "./composio-connector.js";
 import {
