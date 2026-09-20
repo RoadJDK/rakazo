@@ -7,12 +7,22 @@ import type {
   ConnectorTool,
   ManagedConnectorProvider,
 } from "@rakazo/adapter-kit";
+import { catalogToolPrefix } from "./approval-effect.js";
 import { collectPages, filterCatalog } from "./composio-connector.js";
 import {
   combineSignals,
   redactConnectorPayload,
   sanitizeConnectorError,
 } from "./connector-safety.js";
+import {
+  CATALOG_EXECUTE,
+  catalogEntries,
+  DIRECT_TOOL_LIMIT,
+  executeLazyCatalogControl,
+  isLazyCatalogControlRoute,
+  lazyCatalogTools,
+  resolveCatalogCall,
+} from "./lazy-tool-catalog.js";
 import {
   callRemoteMcpTool,
   listRemoteMcpTools,
@@ -150,7 +160,7 @@ export class PipedreamConnector implements ManagedConnectorProvider {
     ];
   }
 
-  async discoverTools(context: AdapterContext): Promise<ConnectorTool[]> {
+  private async allTools(context: AdapterContext): Promise<ConnectorTool[]> {
     const apps =
       context.connectedConnections
         ?.filter((connection) => connection.connectorId === "pipedream")
@@ -168,14 +178,51 @@ export class PipedreamConnector implements ManagedConnectorProvider {
         });
         return tools.map((tool) => ({
           ...tool,
-          route: { connectorId: "pipedream", resourceId: app, toolName: tool.name },
+          route: {
+            connectorId: "pipedream",
+            resourceId: app,
+            toolName: tool.name,
+            catalogGroup: app,
+          },
         }));
       }),
     );
     return groups.flat();
   }
 
+  async discoverTools(context: AdapterContext): Promise<ConnectorTool[]> {
+    const tools = await this.allTools(context);
+    if (tools.length <= DIRECT_TOOL_LIMIT) return tools;
+    return lazyCatalogTools(
+      catalogToolPrefix("pipedream"),
+      "pipedream",
+      "app",
+      catalogEntries(tools),
+    );
+  }
+
+  async resolveCall(
+    call: ConnectorCall,
+    context: AdapterContext,
+  ): Promise<{ call: ConnectorCall; tool: ConnectorTool } | undefined> {
+    // Wrappers have no resourceId; real tools always do.
+    if (call.route?.resourceId || call.route?.toolName !== CATALOG_EXECUTE) return undefined;
+    return resolveCatalogCall(call, catalogEntries(await this.allTools(context)));
+  }
+
   async *execute(call: ConnectorCall, context: AdapterContext): AsyncIterable<ConnectorEvent> {
+    if (isLazyCatalogControlRoute(call.route)) {
+      try {
+        yield* executeLazyCatalogControl(
+          call,
+          catalogEntries(await this.allTools(context)),
+          (resolved) => this.execute(resolved, context),
+        );
+      } catch (error) {
+        yield { type: "error", message: sanitizeConnectorError(error) };
+      }
+      return;
+    }
     const app = call.route?.resourceId;
     if (!app) {
       yield { type: "error", message: "Pipedream app route is missing" };
