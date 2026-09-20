@@ -182,6 +182,67 @@ describe("MCP connector session cache", () => {
     }
   });
 
+  it("records a discovery failure as a failed tool completion", async () => {
+    vi.stubGlobal("fetch", mcpFetch({ failNext: true, initializations: 0 }));
+    const append = vi.fn().mockResolvedValue(undefined);
+    const prisma = {
+      botMcpServer: { findMany: vi.fn().mockResolvedValue([ASSIGNMENT]) },
+      run: { findUnique: vi.fn().mockResolvedValue({ threadId: "thread-1" }) },
+    };
+    const connector = new McpConnector(prisma as never, {} as never, {
+      network: TEST_NETWORK,
+      events: { append },
+    });
+
+    await expect(
+      connector.discoverTools({
+        spaceId: "w1",
+        userId: "u1",
+        botId: "bot-1",
+        runId: "run-1",
+        signal: new AbortController().signal,
+      } as never),
+    ).resolves.toEqual([]);
+
+    expect(append).toHaveBeenCalledTimes(1);
+    expect(append.mock.calls[0]?.[0]).toMatchObject({
+      spaceId: "w1",
+      threadId: "thread-1",
+      botId: "bot-1",
+      runId: "run-1",
+      type: "agent.tool.completed",
+      payload: {
+        name: "mcp__demo__discovery",
+        executionId: "mcp-discovery-demo-run-1",
+        outcome: "error",
+      },
+    });
+    expect(append.mock.calls[0]?.[0].payload.error).toEqual(expect.any(String));
+    await connector.close();
+  });
+
+  it("leaves no discovery event when the failure happens outside a run", async () => {
+    vi.stubGlobal("fetch", mcpFetch({ failNext: true, initializations: 0 }));
+    const append = vi.fn().mockResolvedValue(undefined);
+    const connector = new McpConnector(
+      { botMcpServer: { findMany: vi.fn().mockResolvedValue([ASSIGNMENT]) } } as never,
+      {} as never,
+      { network: TEST_NETWORK, events: { append } },
+    );
+
+    await expect(
+      connector.discoverTools({
+        spaceId: "w1",
+        userId: "u1",
+        botId: "bot-1",
+        signal: new AbortController().signal,
+      } as never),
+    ).resolves.toEqual([]);
+
+    expect(append).not.toHaveBeenCalled();
+    await connector.close();
+  });
+
   it("returns no tools when the MCP catalog is empty", async () => {
     const connector = new McpConnector(
       { botMcpServer: { findMany: vi.fn().mockResolvedValue([]) } } as never,

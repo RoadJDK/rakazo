@@ -6,10 +6,11 @@ import type {
   ConnectorTool,
 } from "@rakazo/adapter-kit";
 import { isLocalMcpHost } from "@rakazo/contracts";
-import type { McpServer, PrismaClient } from "@rakazo/db";
+import type { McpServer, PrismaClient, ThreadEvents } from "@rakazo/db";
 import { getLogger } from "@rakazo/logging";
 import { catalogToolPrefix } from "./approval-effect.js";
 import { redactConnectorPayload, sanitizeConnectorError } from "./connector-safety.js";
+import { appendToolCompletionAudit } from "./executor.js";
 import {
   CATALOG_EXECUTE,
   catalogEntries,
@@ -77,6 +78,8 @@ export class McpConnector implements ConnectorProvider {
       stdioEnabled?: boolean;
       allowedCommands?: string[];
       network?: RemoteTransportDependencies;
+      /** Audit sink for failed discovery. Without it the log line stays the only trace. */
+      events?: Pick<ThreadEvents, "append">;
     } = {},
     private readonly oauth?: McpOAuthBroker,
   ) {}
@@ -122,6 +125,7 @@ export class McpConnector implements ConnectorProvider {
     });
     const groups = await Promise.all(
       assignments.map(async (assignment): Promise<ConnectorTool[]> => {
+        const startedAt = Date.now();
         try {
           const session = await this.sessionFor(assignment.server, context);
           const listed = await session.listTools({ signal: context.signal });
@@ -150,12 +154,61 @@ export class McpConnector implements ConnectorProvider {
             `mcp discovery failed for server ${assignment.server.slug}:`,
             sanitizeConnectorError(error),
           );
-          await this.evict(this.sessionKey(assignment.server, context));
+          // Capture material before eviction so the audited reason stays redacted, the
+          // same reason execute() captures it before callTool.
+          const key = this.sessionKey(assignment.server, context);
+          const material = this.sessions.get(key)?.material;
+          await this.evict(key);
+          await this.recordDiscoveryFailure(
+            assignment.server.slug,
+            error,
+            context,
+            startedAt,
+            material ? oauthMaterialSecrets(material) : [],
+          );
           return [];
         }
       }),
     );
     return groups.flat();
+  }
+
+  /**
+   * Leave a failed discovery where every other tool outcome is already visible, as an
+   * `agent.tool.completed` event with `outcome: "error"`. Losing a server's tools is
+   * otherwise invisible: the run still ends `completed` and the model simply never sees
+   * them. Discovery outside a run (settings, tool pickers) has no thread to attach to, so
+   * there the log line stays the only trace.
+   */
+  private async recordDiscoveryFailure(
+    slug: string,
+    error: unknown,
+    context: AdapterContext,
+    startedAt: number,
+    secrets: string[],
+  ): Promise<void> {
+    const events = this.options.events;
+    if (!events || !context.runId || !context.botId) return;
+    const run = await this.prisma.run
+      .findUnique({ where: { id: context.runId }, select: { threadId: true } })
+      .catch(() => null);
+    if (!run) return;
+    await appendToolCompletionAudit(
+      { events },
+      {
+        spaceId: context.spaceId,
+        threadId: run.threadId,
+        botId: context.botId,
+        runId: context.runId,
+      },
+      {
+        name: `mcp__${slug}__discovery`,
+        executionId: `mcp-discovery-${slug}-${context.runId}`,
+        durationMs: Date.now() - startedAt,
+        error,
+      },
+      secrets,
+    );
   }
 
   async *execute(call: ConnectorCall, context: AdapterContext): AsyncIterable<ConnectorEvent> {
