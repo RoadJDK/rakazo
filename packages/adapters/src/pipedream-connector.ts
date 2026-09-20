@@ -1,4 +1,5 @@
 import { createHmac } from "node:crypto";
+import { getLogger } from "@rakazo/logging";
 import type {
   AdapterContext,
   ConnectorCall,
@@ -169,22 +170,31 @@ export class PipedreamConnector implements ManagedConnectorProvider {
     const token = await this.token();
     const groups = await Promise.all(
       [...new Set(apps)].map(async (app) => {
-        const tools = await listRemoteMcpTools({
-          endpoint: MCP_ENDPOINT,
-          headers: this.mcpHeaders(context, app, token),
-          signal: context.signal,
-          fetch: this.dependencies.fetch,
-          resolveHostname: this.dependencies.resolveHostname,
-        });
-        return tools.map((tool) => ({
-          ...tool,
-          route: {
-            connectorId: "pipedream",
-            resourceId: app,
-            toolName: tool.name,
-            catalogGroup: app,
-          },
-        }));
+        try {
+          const tools = await listRemoteMcpTools({
+            endpoint: MCP_ENDPOINT,
+            headers: this.mcpHeaders(context, app, token),
+            signal: context.signal,
+            fetch: this.dependencies.fetch,
+            resolveHostname: this.dependencies.resolveHostname,
+          });
+          return tools.map((tool) => ({
+            ...tool,
+            route: {
+              connectorId: "pipedream",
+              resourceId: app,
+              toolName: tool.name,
+              catalogGroup: app,
+            },
+          }));
+        } catch (error) {
+          // A single unavailable app must not hide tools from other connections.
+          getLogger().error(
+            `pipedream discovery failed for app ${app}:`,
+            sanitizeConnectorError(error),
+          );
+          return [];
+        }
       }),
     );
     return groups.flat();

@@ -461,6 +461,27 @@ describe("PipedreamConnector", () => {
     expect(index).toHaveLength(21);
   });
 
+  it("keeps other apps when one connected app fails discovery", async () => {
+    const healthy = pipedreamMcpFetch(appTools("gmail", 21));
+    const fetch = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      const request = input instanceof Request ? input : new Request(input, init);
+      if (new URL(request.url).pathname === "/v1/oauth/token") {
+        return Response.json({ access_token: "fake-access-token", expires_in: 3_600 });
+      }
+      if (request.headers.get("x-pd-app-slug") === "broken") {
+        return new Response("upstream down", { status: 503 });
+      }
+      return healthy(input, init);
+    });
+    const connector = new PipedreamConnector(FAKE_CONFIG, { ...TEST_NETWORK, fetch });
+    const tools = await connector.discoverTools(connectedContext("broken", "gmail"));
+    expect(tools.map((tool) => tool.name)).toEqual([
+      "pipedream_search_tools",
+      "pipedream_load_tool",
+      "pipedream_execute_tool",
+    ]);
+  });
+
   it("lists catalog names grouped by connected app", async () => {
     const connector = new PipedreamConnector(FAKE_CONFIG, {
       ...TEST_NETWORK,
