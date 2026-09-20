@@ -71,10 +71,6 @@ function reportAllowlistDrift(
 export class McpConnector implements ConnectorProvider {
   private readonly sessions = new Map<string, SessionEntry>();
   private readonly connecting = new Map<string, PendingSession>();
-  // A connect that throws never reaches `sessions`, so its OAuth material would be
-  // lost right where it is needed: the transport error can quote the token it just
-  // sent. Park it here on failure, consume it once, drop it.
-  private readonly failedMaterial = new Map<string, OAuthMaterial>();
   // Discovery runs more than once per run: once up front, then again on every lazy
   // catalog access. Each attempt needs its own executionId.
   private discoverySeq = 0;
@@ -164,7 +160,7 @@ export class McpConnector implements ConnectorProvider {
           // Capture material before eviction so the audited reason stays redacted, the
           // same reason execute() captures it before callTool.
           const key = this.sessionKey(assignment.server, context);
-          const material = this.sessions.get(key)?.material ?? this.takeFailedMaterial(key);
+          const material = this.sessions.get(key)?.material;
           await this.evict(key);
           await this.recordDiscoveryFailure(
             assignment.server.slug,
@@ -276,9 +272,7 @@ export class McpConnector implements ConnectorProvider {
       yield { type: "result", data: redactConnectorPayload(result, secrets) };
     } catch (error) {
       // A thrown call means the transport or auth broke; drop the session so the next call reconnects.
-      // A connect that never registered leaves its material parked, not in `sessions`.
-      const failed = material ?? this.takeFailedMaterial(sessionKey);
-      const secrets = failed ? oauthMaterialSecrets(failed) : [];
+      const secrets = material ? oauthMaterialSecrets(material) : [];
       await this.evict(sessionKey);
       yield { type: "error", message: sanitizeConnectorError(error, secrets) };
     }
@@ -289,14 +283,6 @@ export class McpConnector implements ConnectorProvider {
     await Promise.all([...this.sessions.values()].map(({ session }) => session.close()));
     this.sessions.clear();
     this.connecting.clear();
-    this.failedMaterial.clear();
-  }
-
-  /** OAuth material of a connect that never registered a session. Readable once. */
-  private takeFailedMaterial(sessionKey: string): OAuthMaterial | undefined {
-    const material = this.failedMaterial.get(sessionKey);
-    this.failedMaterial.delete(sessionKey);
-    return material;
   }
 
   private sessionKey(server: McpServer, context: AdapterContext): string {
@@ -327,8 +313,6 @@ export class McpConnector implements ConnectorProvider {
 
     const promise = this.connectSession(server, context).then(({ session, material }) => {
       this.sessions.set(sessionKey, { session, revision: server.revision, material });
-      // The live entry is authoritative from here; keep no decrypted copy beside it.
-      this.failedMaterial.delete(sessionKey);
       return session;
     });
     this.connecting.set(sessionKey, { revision: server.revision, promise });
@@ -402,11 +386,13 @@ export class McpConnector implements ConnectorProvider {
       }
       return { session, material };
     } catch (error) {
-      // The session never reaches `sessions`, so park the material for the caller
-      // that has to redact this very error.
-      if (material) this.failedMaterial.set(this.sessionKey(server, context), material);
       await session.close().catch(() => undefined);
-      throw error;
+      // Redact here, while the material is still in hand. This one rejection is handed
+      // to every caller waiting on the same pending connect, and none of them can see
+      // the secrets: the session never reached `sessions`. Sanitizing per caller would
+      // cover only whoever looked first.
+      if (!material) throw error;
+      throw new Error(sanitizeConnectorError(error, oauthMaterialSecrets(material)));
     }
   }
 }

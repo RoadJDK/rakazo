@@ -263,6 +263,57 @@ describe("MCP connector session cache", () => {
     await connector.close();
   });
 
+  it("redacts the same failed connect for every concurrent waiter", async () => {
+    const localAssignment = {
+      ...ASSIGNMENT,
+      server: { ...SERVER, endpoint: "http://localhost:8123/api/mcp", secretId: "secret-1" },
+    };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("rejected credential local-key", { status: 500 })),
+    );
+    const append = vi.fn().mockResolvedValue(undefined);
+    const prisma = {
+      botMcpServer: {
+        findMany: vi.fn().mockResolvedValue([localAssignment]),
+        findFirst: vi.fn().mockResolvedValue(localAssignment),
+      },
+      secret: { findFirst: vi.fn().mockResolvedValue({ id: "secret-1", ciphertext: "encrypted" }) },
+      run: { findUnique: vi.fn().mockResolvedValue({ threadId: "thread-1" }) },
+    };
+    const connector = new McpConnector(
+      prisma as never,
+      {
+        load: vi.fn().mockReturnValue(JSON.stringify({ headers: { "X-Api-Key": "local-key" } })),
+      } as never,
+      { network: TEST_NETWORK, events: { append } },
+    );
+    const context = {
+      spaceId: "w1",
+      userId: "u1",
+      botId: "bot-1",
+      runId: "run-1",
+      signal: new AbortController().signal,
+    };
+
+    // Both callers land on the same pending connect, so both receive the one
+    // rejection it produces. Neither may see the credential it reflected.
+    const [first, second] = await Promise.all([
+      connector.discoverTools(context as never),
+      connector.discoverTools(context as never),
+    ]);
+
+    expect(first).toEqual([]);
+    expect(second).toEqual([]);
+    expect(append).toHaveBeenCalledTimes(2);
+    for (const call of append.mock.calls) {
+      const message = String(call[0].payload.error);
+      expect(message).not.toContain("local-key");
+      expect(message).toContain("[redacted]");
+    }
+    await connector.close();
+  });
+
   it("gives every discovery failure of one run its own executionId", async () => {
     vi.stubGlobal("fetch", mcpFetch({ failNext: true, initializations: 0 }));
     const append = vi.fn().mockResolvedValue(undefined);
