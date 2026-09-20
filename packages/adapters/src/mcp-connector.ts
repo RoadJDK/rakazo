@@ -71,6 +71,13 @@ function reportAllowlistDrift(
 export class McpConnector implements ConnectorProvider {
   private readonly sessions = new Map<string, SessionEntry>();
   private readonly connecting = new Map<string, PendingSession>();
+  // A connect that throws never reaches `sessions`, so its OAuth material would be
+  // lost right where it is needed: the transport error can quote the token it just
+  // sent. Park it here on failure, consume it once, drop it.
+  private readonly failedMaterial = new Map<string, OAuthMaterial>();
+  // Discovery runs more than once per run: once up front, then again on every lazy
+  // catalog access. Each attempt needs its own executionId.
+  private discoverySeq = 0;
   constructor(
     private readonly prisma: PrismaClient,
     private readonly secrets: EncryptedSecretStore,
@@ -157,7 +164,7 @@ export class McpConnector implements ConnectorProvider {
           // Capture material before eviction so the audited reason stays redacted, the
           // same reason execute() captures it before callTool.
           const key = this.sessionKey(assignment.server, context);
-          const material = this.sessions.get(key)?.material;
+          const material = this.sessions.get(key)?.material ?? this.takeFailedMaterial(key);
           await this.evict(key);
           await this.recordDiscoveryFailure(
             assignment.server.slug,
@@ -203,7 +210,7 @@ export class McpConnector implements ConnectorProvider {
       },
       {
         name: `mcp__${slug}__discovery`,
-        executionId: `mcp-discovery-${slug}-${context.runId}`,
+        executionId: `mcp-discovery-${slug}-${context.runId}-${this.discoverySeq++}`,
         durationMs: Date.now() - startedAt,
         error,
       },
@@ -258,9 +265,10 @@ export class McpConnector implements ConnectorProvider {
     // drop this call's OAuth secrets from model-visible redaction. Recompute via
     // oauthMaterialSecrets(material) so in-place token refresh stays covered.
     let material: OAuthMaterial | undefined;
+    const sessionKey = this.sessionKey(assignment.server, context);
     try {
       const session = await this.sessionFor(assignment.server, context);
-      material = this.sessions.get(this.sessionKey(assignment.server, context))?.material;
+      material = this.sessions.get(sessionKey)?.material;
       const result = await session.callTool(call.route.toolName, call.args, {
         signal: context.signal,
       });
@@ -268,8 +276,10 @@ export class McpConnector implements ConnectorProvider {
       yield { type: "result", data: redactConnectorPayload(result, secrets) };
     } catch (error) {
       // A thrown call means the transport or auth broke; drop the session so the next call reconnects.
-      const secrets = material ? oauthMaterialSecrets(material) : [];
-      await this.evict(this.sessionKey(assignment.server, context));
+      // A connect that never registered leaves its material parked, not in `sessions`.
+      const failed = material ?? this.takeFailedMaterial(sessionKey);
+      const secrets = failed ? oauthMaterialSecrets(failed) : [];
+      await this.evict(sessionKey);
       yield { type: "error", message: sanitizeConnectorError(error, secrets) };
     }
   }
@@ -279,6 +289,14 @@ export class McpConnector implements ConnectorProvider {
     await Promise.all([...this.sessions.values()].map(({ session }) => session.close()));
     this.sessions.clear();
     this.connecting.clear();
+    this.failedMaterial.clear();
+  }
+
+  /** OAuth material of a connect that never registered a session. Readable once. */
+  private takeFailedMaterial(sessionKey: string): OAuthMaterial | undefined {
+    const material = this.failedMaterial.get(sessionKey);
+    this.failedMaterial.delete(sessionKey);
+    return material;
   }
 
   private sessionKey(server: McpServer, context: AdapterContext): string {
@@ -309,6 +327,8 @@ export class McpConnector implements ConnectorProvider {
 
     const promise = this.connectSession(server, context).then(({ session, material }) => {
       this.sessions.set(sessionKey, { session, revision: server.revision, material });
+      // The live entry is authoritative from here; keep no decrypted copy beside it.
+      this.failedMaterial.delete(sessionKey);
       return session;
     });
     this.connecting.set(sessionKey, { revision: server.revision, promise });
@@ -324,6 +344,8 @@ export class McpConnector implements ConnectorProvider {
     context: AdapterContext,
   ): Promise<{ session: McpSession; material: OAuthMaterial }> {
     const session = new McpSession({ name: `rakazo-${server.slug}` });
+    // Hoisted so a throw after the secret is decoded can still hand the material out.
+    let material: OAuthMaterial | undefined;
     try {
       const secret = server.secretId
         ? await this.prisma.secret.findFirst({
@@ -334,7 +356,7 @@ export class McpConnector implements ConnectorProvider {
             },
           })
         : null;
-      const material = secret
+      material = secret
         ? (JSON.parse(this.secrets.load(secret.ciphertext, secret.id)) as OAuthMaterial)
         : {};
       const loaded = { material, ...(secret ? { secretId: secret.id } : {}) };
@@ -380,6 +402,9 @@ export class McpConnector implements ConnectorProvider {
       }
       return { session, material };
     } catch (error) {
+      // The session never reaches `sessions`, so park the material for the caller
+      // that has to redact this very error.
+      if (material) this.failedMaterial.set(this.sessionKey(server, context), material);
       await session.close().catch(() => undefined);
       throw error;
     }

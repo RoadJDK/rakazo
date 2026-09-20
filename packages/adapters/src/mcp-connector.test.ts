@@ -213,11 +213,83 @@ describe("MCP connector session cache", () => {
       type: "agent.tool.completed",
       payload: {
         name: "mcp__demo__discovery",
-        executionId: "mcp-discovery-demo-run-1",
+        executionId: "mcp-discovery-demo-run-1-0",
         outcome: "error",
       },
     });
     expect(append.mock.calls[0]?.[0].payload.error).toEqual(expect.any(String));
+    await connector.close();
+  });
+
+  it("redacts credentials of a connect that failed before the session was cached", async () => {
+    const localAssignment = {
+      ...ASSIGNMENT,
+      server: { ...SERVER, endpoint: "http://localhost:8123/api/mcp", secretId: "secret-1" },
+    };
+    // The connect itself fails, so the session never reaches the cache. The upstream
+    // body quotes back the header it was sent, the way a strict server rejects one.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("rejected credential local-key", { status: 500 })),
+    );
+    const append = vi.fn().mockResolvedValue(undefined);
+    const prisma = {
+      botMcpServer: { findMany: vi.fn().mockResolvedValue([localAssignment]) },
+      secret: { findFirst: vi.fn().mockResolvedValue({ id: "secret-1", ciphertext: "encrypted" }) },
+      run: { findUnique: vi.fn().mockResolvedValue({ threadId: "thread-1" }) },
+    };
+    const connector = new McpConnector(
+      prisma as never,
+      {
+        load: vi.fn().mockReturnValue(JSON.stringify({ headers: { "X-Api-Key": "local-key" } })),
+      } as never,
+      { network: TEST_NETWORK, events: { append } },
+    );
+
+    await expect(
+      connector.discoverTools({
+        spaceId: "w1",
+        userId: "u1",
+        botId: "bot-1",
+        runId: "run-1",
+        signal: new AbortController().signal,
+      } as never),
+    ).resolves.toEqual([]);
+
+    expect(append).toHaveBeenCalledTimes(1);
+    const reason = String(append.mock.calls[0]?.[0].payload.error);
+    expect(reason).not.toContain("local-key");
+    expect(reason).toContain("[redacted]");
+    await connector.close();
+  });
+
+  it("gives every discovery failure of one run its own executionId", async () => {
+    vi.stubGlobal("fetch", mcpFetch({ failNext: true, initializations: 0 }));
+    const append = vi.fn().mockResolvedValue(undefined);
+    const prisma = {
+      botMcpServer: { findMany: vi.fn().mockResolvedValue([ASSIGNMENT]) },
+      run: { findUnique: vi.fn().mockResolvedValue({ threadId: "thread-1" }) },
+    };
+    const connector = new McpConnector(prisma as never, {} as never, {
+      network: TEST_NETWORK,
+      events: { append },
+    });
+    const context = {
+      spaceId: "w1",
+      userId: "u1",
+      botId: "bot-1",
+      runId: "run-1",
+      signal: new AbortController().signal,
+    };
+
+    // Discovery is reached again on every lazy catalog access inside the same run.
+    await connector.discoverTools(context as never);
+    await connector.discoverTools(context as never);
+
+    expect(append).toHaveBeenCalledTimes(2);
+    const ids = append.mock.calls.map((call) => call[0].payload.executionId);
+    expect(new Set(ids).size).toBe(2);
+    for (const id of ids) expect(id).toMatch(/^mcp-discovery-demo-run-1-\d+$/);
     await connector.close();
   });
 
