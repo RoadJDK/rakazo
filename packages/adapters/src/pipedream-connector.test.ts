@@ -436,6 +436,30 @@ describe("PipedreamConnector", () => {
     }
   });
 
+  it("includes every connected app when more than 20 apps have one tool each", async () => {
+    const apps = Array.from({ length: 21 }, (_, index) => `app_${index}`);
+    const toolsByApp = Object.fromEntries(apps.map((app) => [app, [`${app}_tool`]]));
+    const connector = new PipedreamConnector(FAKE_CONFIG, {
+      ...TEST_NETWORK,
+      fetch: pipedreamMcpFetch(toolsByApp),
+    });
+    const context = connectedContext(...apps);
+    const [search] = await connector.discoverTools(context);
+
+    expect(search?.name).toBe("pipedream_search_tools");
+
+    const events = [];
+    for await (const event of connector.execute(
+      { tool: search!.name, args: {}, executionId: "search-many-apps", route: search!.route },
+      context,
+    )) {
+      events.push(event);
+    }
+
+    const index = (events[0] as { data?: { index?: Array<{ group: string }> } })?.data?.index;
+    expect(index?.map((entry) => entry.group)).toEqual(apps);
+  });
+
   it("lists catalog names grouped by connected app", async () => {
     const connector = new PipedreamConnector(FAKE_CONFIG, {
       ...TEST_NETWORK,

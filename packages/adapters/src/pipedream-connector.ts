@@ -168,7 +168,7 @@ export class PipedreamConnector implements ManagedConnectorProvider {
     if (apps.length === 0) return [];
     const token = await this.token();
     const groups = await Promise.all(
-      [...new Set(apps)].slice(0, 20).map(async (app) => {
+      [...new Set(apps)].map(async (app) => {
         const tools = await listRemoteMcpTools({
           endpoint: MCP_ENDPOINT,
           headers: this.mcpHeaders(context, app, token),
