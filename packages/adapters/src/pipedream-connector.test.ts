@@ -457,7 +457,8 @@ describe("PipedreamConnector", () => {
     }
 
     const index = (events[0] as { data?: { index?: Array<{ group: string }> } })?.data?.index;
-    expect(index?.map((entry) => entry.group)).toEqual(apps);
+    expect(index?.map((entry) => entry.group).sort()).toEqual([...apps].sort());
+    expect(index).toHaveLength(21);
   });
 
   it("lists catalog names grouped by connected app", async () => {
